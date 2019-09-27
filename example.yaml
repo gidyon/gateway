@@ -1,25 +1,18 @@
 services:
   accounts:
-    url: https://accounts.mydomain.com
-    prefix: /api/account/
-    resources:
-    - account
-    - profile
-    - user
-    - admin
-    tls:
-      key: /run/secrets/tls_key
-      cert: /run/secrets/tls_cert
+    gatewayPath: /api/account/
+    address: accounts.mydomain.com
+    port: 443
+    security:
+      tlsKey: /run/secrets/tls_key
+      tlsCert: /run/secrets/tls_cert
       server: accounts.mydomain.com
   
   notifications:
-    url: https://notifications.mydomain.com
-    prefix: /api/notifications/
-    resources:
-    - notification
-    - channel
-    - subscriber
-    tls:
-      key: /run/secrets/tls_key
-      cert: /run/secrets/tls_cert
+    gatewayPath: /api/notifications/
+    address: notifications.mydomain.com
+    port: 443
+    security:
+      tlsKey: /run/secrets/tls_key
+      tlsCert: /run/secrets/tls_cert
       server: notifications.mydomain.com
