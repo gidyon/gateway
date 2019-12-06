@@ -1,57 +1,75 @@
 package gateway
 
 import (
-	"crypto/tls"
-	"crypto/x509"
 	"fmt"
-	"github.com/Sirupsen/logrus"
 	"github.com/pkg/errors"
 	yaml "gopkg.in/yaml.v2"
 	"io"
 	"io/ioutil"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
-	"time"
+	"sync"
 )
 
-// Service holds security and discovery information for a micro-service
-type Service struct {
-	Name        string `yaml:"name"`
-	GatewayPath string `yaml:"gatewayPath"`
-	Address     string `yaml:"address"`
-	Port        int    `yaml:"port"`
-	Security    struct {
-		TLSKey     string `yaml:"tlsKey"`
-		TLSCert    string `yaml:"tlsCert"`
-		ServerName string `yaml:"server"`
+type bufferPool interface {
+	Get() []byte
+	Put([]byte)
+}
+
+type gatewayBufferPool struct {
+	pool *sync.Pool
+}
+
+// newBufferPool creates a bytes pool to be used by httputil reverse proxy while copying response
+func newBufferPool() httputil.BufferPool {
+	return &gatewayBufferPool{
+		pool: &sync.Pool{
+			New: func() interface{} {
+				mem := make([]byte, 32*1024)
+				return mem
+			},
+		},
 	}
-	client *http.Client
+}
+
+func (buf *gatewayBufferPool) Get() []byte {
+	return buf.pool.Get().([]byte)
+}
+
+func (buf *gatewayBufferPool) Put(bs []byte) {
+	buf.pool.Put(bs)
 }
 
 // serviceGate contains information about gateway services and internals
 type serviceGate struct {
-	muxer          *http.ServeMux
-	services       map[string]*Service
-	servicesFile   string
-	redirectStatus int
-	development    bool
+	muxer              *http.ServeMux
+	requestMiddleware  func(*http.Request)
+	responseMiddleware func(*http.Response) error
+	errorHandler       func(http.ResponseWriter, *http.Request, error)
+	services           map[string]*Service
+	servicesFile       string
+	redirectStatus     int
+	development        bool
 }
 
 // New creates a service gateway that proxies requests to the most appropriate service in the services entries.
 func New(redirectCode int, services []*Service) (h http.Handler, err error) {
 	defer func() {
 		if err1 := recover(); err1 != nil {
-			err = errors.Errorf("panic happened: %v", err1)
+			err = errors.Errorf("unrecoverable error happened: %v", err1)
 		}
 	}()
 
 	gw := &serviceGate{
-		muxer:          http.NewServeMux(),
-		services:       make(map[string]*Service),
-		servicesFile:   "",
-		redirectStatus: redirectCode,
+		muxer:              http.NewServeMux(),
+		services:           make(map[string]*Service),
+		redirectStatus:     redirectCode,
+		requestMiddleware:  func(*http.Request) {},
+		responseMiddleware: func(*http.Response) error { return nil },
 	}
 
 	gwServices := make(map[string]*Service)
@@ -60,10 +78,15 @@ func New(redirectCode int, services []*Service) (h http.Handler, err error) {
 		if srv.Name == "" {
 			return nil, errors.New("name of service is required")
 		}
+
 		gwServices[srv.Name] = &Service{
 			Name:        srv.Name,
 			GatewayPath: srv.GatewayPath,
 			Port:        srv.Port,
+			Security:    &ServiceTLSOptions{},
+			HTTP2: &HTTP2Options{
+				ServerPush: &ServerPush{},
+			},
 		}
 		gwServices[srv.Name].Security.TLSCert = srv.Security.TLSCert
 		gwServices[srv.Name].Security.TLSKey = srv.Security.TLSKey
@@ -72,12 +95,12 @@ func New(redirectCode int, services []*Service) (h http.Handler, err error) {
 
 	gw.services = gwServices
 
-	err = gw.updateGateway()
+	err = gw.updateServices()
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to update gateway")
 	}
 
-	return nil, nil
+	return gw, nil
 }
 
 // NewFromFile creates a service gateway that provies requests to the most appropriate service by reading services configuration from yaml file
@@ -89,10 +112,22 @@ func NewFromFile(redirectCode int, servicesFile string) (h http.Handler, err err
 	}()
 
 	gw := &serviceGate{
-		muxer:          http.NewServeMux(),
-		services:       make(map[string]*Service),
-		servicesFile:   servicesFile,
-		redirectStatus: redirectCode,
+		muxer:              http.NewServeMux(),
+		services:           make(map[string]*Service),
+		servicesFile:       servicesFile,
+		redirectStatus:     redirectCode,
+		requestMiddleware:  func(*http.Request) {},
+		responseMiddleware: func(*http.Response) error { return nil },
+	}
+
+	// Set mode for handling CORS
+	mode, ok := os.LookupEnv("MODE")
+	if ok {
+		mode, err := strconv.ParseBool(mode)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to read mode")
+		}
+		gw.development = mode
 	}
 
 	// Read the service definitions from YAML
@@ -103,7 +138,7 @@ func NewFromFile(redirectCode int, servicesFile string) (h http.Handler, err err
 
 	gw.services = services
 
-	err = gw.updateGateway()
+	err = gw.updateServices()
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to update gateway")
 	}
@@ -111,104 +146,39 @@ func NewFromFile(redirectCode int, servicesFile string) (h http.Handler, err err
 	return gw, err
 }
 
-func (serviceGate *serviceGate) updateGateway() error {
-	// Set mode for handling CORS
-	mode, ok := os.LookupEnv("MODE")
-	if ok {
-		mode, err := strconv.ParseBool(mode)
-		if err != nil {
-			return errors.Wrap(err, "failed to read mode")
-		}
-		serviceGate.development = mode
-	}
-
+func (serviceGate *serviceGate) updateServices() error {
 	for serviceID, srv := range serviceGate.services {
-		var warn bool
-
-		address := strings.TrimPrefix(srv.Address, "https://")
-		address = strings.TrimSuffix(address, "/")
-		serviceGate.services[serviceID].Address = fmt.Sprintf("https://%s", address)
-
-		gatewayPath := strings.TrimPrefix(srv.GatewayPath, "/")
-		serviceGate.services[serviceID].GatewayPath = fmt.Sprintf("/%s", gatewayPath)
-
-		serviceGate.services[serviceID].Name = serviceID
-
-		if srv.GatewayPath == "" {
-			return errors.Errorf("service %q: gateway path cannot be empty", serviceID)
-		}
-		if srv.Address == "" {
-			return errors.Errorf("service %q: address cannot be empty", serviceID)
-		}
-		if srv.Port == 0 {
-			warn = true
-			serviceGate.services[serviceID].Port = 443
-			logrus.Warnf("using default port 443 for service %q", serviceID)
-		}
-		if srv.Security.TLSCert == "" {
-			warn = true
-			serviceGate.services[serviceID].Security.TLSCert = "certs/cert.pem"
-			logrus.Warnf("using default tls public key for service %q", serviceID)
-		}
-		if srv.Security.ServerName == "" {
-			warn = true
-			logrus.Warnf("using default tls server name for service %q", serviceID)
+		// its safe
+		if srv.HTTP2 == nil {
+			srv.HTTP2 = &HTTP2Options{
+				ServerPush: &ServerPush{
+					Enabled: false,
+				},
+			}
 		}
 
-		// Print one line space to separate service warning
-		if warn {
-			fmt.Println()
+		// its more safe
+		if srv.HTTP2.ServerPush == nil {
+			srv.HTTP2.ServerPush = &ServerPush{
+				Enabled: false,
+			}
+		}
+
+		srv.Name = serviceID
+
+		err := srv.init(serviceGate)
+		if err != nil {
+			return errors.Errorf("failed to update service %q: %v", serviceID, err)
 		}
 
 		serviceID := serviceID
-		err := serviceGate.createHTTPClient(serviceID)
-		if err != nil {
-			return err
-		}
+		path := strings.TrimSuffix(srv.GatewayPath, "/") + "/"
 
-		path := serviceGate.services[serviceID].GatewayPath
+		// update muxer for the service
 		serviceGate.muxer.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
-			serviceGate.do(w, r, serviceID)
+			serviceGate.proxy(w, r, serviceID)
 		})
 	}
-
-	return nil
-}
-
-func (serviceGate *serviceGate) createHTTPClient(serviceID string) error {
-	srv, ok := serviceGate.services[serviceID]
-	if !ok {
-		return errors.Errorf("service %q not found", serviceID)
-	}
-
-	b, err := ioutil.ReadFile(srv.Security.TLSCert)
-	if err != nil {
-		return errors.Wrap(err, "FAILED_TO_READ_CERT_FILE")
-	}
-
-	// append to cert pool
-	cp := x509.NewCertPool()
-	if !cp.AppendCertsFromPEM(b) {
-		msg := fmt.Sprintf("FAILED_TO_APPEND_CERT: %v", err)
-		return errors.New(msg)
-	}
-
-	// service client tls
-	srvTLS := &tls.Config{
-		ServerName:         srv.Security.ServerName,
-		RootCAs:            cp,
-		InsecureSkipVerify: true,
-	}
-
-	// service client transport
-	tr := &http.Transport{
-		MaxIdleConns:    50,
-		IdleConnTimeout: 30 * time.Second,
-		TLSClientConfig: srvTLS,
-	}
-
-	// set service http client
-	serviceGate.services[serviceID].client = &http.Client{Transport: tr}
 
 	return nil
 }
@@ -230,48 +200,45 @@ func (serviceGate *serviceGate) ServeHTTP(w http.ResponseWriter, r *http.Request
 	serviceGate.muxer.ServeHTTP(w, r)
 }
 
-func (serviceGate *serviceGate) do(w http.ResponseWriter, r *http.Request, serviceID string) {
+func cloneHeader(h http.Header) http.Header {
+	h2 := make(http.Header, len(h))
+	for k, vv := range h {
+		vv2 := make([]string, len(vv))
+		copy(vv2, vv)
+		h2[k] = vv2
+	}
+	return h2
+}
+
+func (serviceGate *serviceGate) proxy(w http.ResponseWriter, r *http.Request, serviceID string) {
 	srv, ok := serviceGate.services[serviceID]
 	if !ok {
 		http.Error(w, fmt.Sprintf("service %q not found", serviceID), http.StatusNotFound)
 		return
 	}
 
-	url := srv.Address + r.URL.Path
-	req, err := http.NewRequest(r.Method, url, r.Body)
-	if err != nil {
+	// push content to the client if the service has push support
+	srv.pushContent(w, r)
+
+	newURL, err := url.Parse(srv.Address + r.URL.Path)
+	if err != nil && err != io.EOF {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	req.Header = r.Header
+	// update the URL paths
+	r.Host = newURL.Host
+	r.URL.Host = newURL.Host
+	r.URL.Scheme = newURL.Scheme
+	r.Header.Set("X-Forwarded-Host", r.Header.Get("Host"))
 
-	res, err := srv.client.Do(req)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	defer res.Body.Close()
-
+	// update CORs headers
 	if serviceGate.development {
 		w.Header().Set("access-control-allow-origin", r.Header.Get("origin"))
 		w.Header().Set("access-control-allow-credentials", "true")
 	}
 
-	// update response headers. Important
-	for header, vals := range res.Header {
-		for _, val := range vals {
-			w.Header().Add(header, val)
-		}
-	}
-
-	w.WriteHeader(res.StatusCode)
-
-	_, err = io.Copy(w, res.Body)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
+	srv.proxy.ServeHTTP(w, r)
 }
 
 type services struct {
@@ -289,7 +256,7 @@ func readYAML(filename string) (map[string]*Service, error) {
 		Services: make(map[string]*Service, 0),
 	}
 
-	err = yaml.Unmarshal(bs, srvs)
+	err = yaml.UnmarshalStrict(bs, srvs)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to unmarshal yaml")
 	}
