@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"fmt"
+	"github.com/Sirupsen/logrus"
 	"github.com/pkg/errors"
 	yaml "gopkg.in/yaml.v2"
 	"io"
@@ -56,6 +57,27 @@ type serviceGate struct {
 	development        bool
 }
 
+func newServiceGate(redirectCode int) *serviceGate {
+	gw := &serviceGate{
+		muxer:              http.NewServeMux(),
+		services:           make(map[string]*Service),
+		redirectStatus:     redirectCode,
+		requestMiddleware:  func(*http.Request) {},
+		responseMiddleware: func(*http.Response) error { return nil },
+	}
+
+	mode, ok := os.LookupEnv("MODE")
+	if ok {
+		mode, err := strconv.ParseBool(mode)
+		if err != nil {
+			logrus.Warn("service mode not boolean; default to false")
+		}
+		gw.development = mode
+	}
+
+	return gw
+}
+
 // New creates a service gateway that proxies requests to the most appropriate service in the services entries.
 func New(redirectCode int, services []*Service) (h http.Handler, err error) {
 	defer func() {
@@ -64,13 +86,7 @@ func New(redirectCode int, services []*Service) (h http.Handler, err error) {
 		}
 	}()
 
-	gw := &serviceGate{
-		muxer:              http.NewServeMux(),
-		services:           make(map[string]*Service),
-		redirectStatus:     redirectCode,
-		requestMiddleware:  func(*http.Request) {},
-		responseMiddleware: func(*http.Response) error { return nil },
-	}
+	gw := newServiceGate(redirectCode)
 
 	gwServices := make(map[string]*Service)
 
@@ -111,14 +127,7 @@ func NewFromFile(redirectCode int, servicesFile string) (h http.Handler, err err
 		}
 	}()
 
-	gw := &serviceGate{
-		muxer:              http.NewServeMux(),
-		services:           make(map[string]*Service),
-		servicesFile:       servicesFile,
-		redirectStatus:     redirectCode,
-		requestMiddleware:  func(*http.Request) {},
-		responseMiddleware: func(*http.Response) error { return nil },
-	}
+	gw := newServiceGate(redirectCode)
 
 	// Set mode for handling CORS
 	mode, ok := os.LookupEnv("MODE")
