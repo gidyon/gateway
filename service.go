@@ -9,19 +9,47 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/http/httputil"
-	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
+
+type bufferPool interface {
+	Get() []byte
+	Put([]byte)
+}
+
+type gatewayBufferPool struct {
+	pool *sync.Pool
+}
+
+// newBufferPool creates a bytes pool to be used by reverse proxy server while copying responses
+func newBufferPool() httputil.BufferPool {
+	return &gatewayBufferPool{
+		pool: &sync.Pool{
+			New: func() interface{} {
+				mem := make([]byte, 32*1024)
+				return mem
+			},
+		},
+	}
+}
+
+func (buf *gatewayBufferPool) Get() []byte {
+	return buf.pool.Get().([]byte)
+}
+
+func (buf *gatewayBufferPool) Put(bs []byte) {
+	buf.pool.Put(bs)
+}
 
 // Service is a service in a cluster network
 type Service struct {
 	Name               string             `yaml:"name"`
-	GatewayPath        string             `yaml:"gatewayPath"`
+	URLPath            string             `yaml:"urlPath"`
 	Address            string             `yaml:"address"`
 	Port               int                `yaml:"port"`
 	Security           *ServiceTLSOptions `yaml:"security"`
-	HTTP2              *HTTP2Options      `yaml:"http2"`
 	proxy              *httputil.ReverseProxy
 	responseBufferPool httputil.BufferPool
 }
@@ -33,40 +61,17 @@ type ServiceTLSOptions struct {
 	ServerName string `yaml:"server"`
 }
 
-// HTTP2Options contains options to be used to set http2 functionalities
-type HTTP2Options struct {
-	ServerPush *ServerPush `yaml:"serverPush"`
-}
-
-// ServerPush contains options for http2 Server Push
-type ServerPush struct {
-	Enabled      bool                `yaml:"enabled"`
-	PushContents []*PushContent      `yaml:"pushContents"`
-	pushMap      map[string][]string `yaml:"-"`
-	options      *http.PushOptions   `yaml:"-"`
-}
-
-// PushContent contains content to push to client when any of paths is accessed
-type PushContent struct {
-	Paths       []string `yaml:"paths"`
-	Directories []string `yaml:"dirs"`
-	Files       []string `yaml:"files"`
-}
-
-func (srv *Service) init(serviceGate *serviceGate) error {
+func (srv *Service) update(serviceGate *ServiceGate) error {
+	// checks service information is correct
 	err := srv.validate()
 	if err != nil {
 		return errors.Wrap(err, "failed to validate service")
 	}
 
+	// creates a proxy for the service
 	err = srv.createProxy(serviceGate)
 	if err != nil {
 		return errors.Wrap(err, "failed to create service proxy")
-	}
-
-	err = srv.updateHTTP2(serviceGate)
-	if err != nil {
-		return errors.Wrap(err, "failed to updated service http2 features")
 	}
 
 	return nil
@@ -74,20 +79,19 @@ func (srv *Service) init(serviceGate *serviceGate) error {
 
 func (srv *Service) validate() error {
 	var (
-		warn        bool
-		address     = strings.TrimPrefix(srv.Address, "https://")
-		gatewayPath = strings.TrimPrefix(srv.GatewayPath, "/")
+		warn bool
 	)
 
-	address = strings.TrimSuffix(address, "/")
+	address := strings.TrimPrefix(strings.TrimSuffix(srv.Address, "/"), "https://")
 	srv.Address = fmt.Sprintf("https://%s", address)
 	if srv.Address == "" {
-		return errors.Errorf("service %q: address cannot be empty", srv.Name)
+		return errors.Errorf("service %q address cannot be empty", srv.Name)
 	}
 
-	srv.GatewayPath = fmt.Sprintf("/%s", gatewayPath)
-	if srv.GatewayPath == "" {
-		return errors.Errorf("service %q: gateway path cannot be empty", srv.Name)
+	URLPath := strings.TrimPrefix(srv.URLPath, "/")
+	srv.URLPath = fmt.Sprintf("/%s", URLPath)
+	if srv.URLPath == "" {
+		return errors.Errorf("service %q url path cannot be empty", srv.Name)
 	}
 
 	if srv.Port == 0 {
@@ -95,6 +99,7 @@ func (srv *Service) validate() error {
 		srv.Port = 443
 		logrus.Warnf("using default port 443 for service %q", srv.Name)
 	}
+
 	if srv.Security.TLSCert == "" {
 		warn = true
 		srv.Security.TLSCert = "certs/cert.pem"
@@ -113,9 +118,9 @@ func (srv *Service) validate() error {
 	return nil
 }
 
-func (srv *Service) createProxy(serviceGate *serviceGate) error {
+func (srv *Service) createProxy(serviceGate *ServiceGate) error {
 	if serviceGate == nil {
-		return errors.New("service gate should not be nil")
+		return errors.New("service gateway should not be nil")
 	}
 	if srv == nil {
 		return errors.Errorf("service %q should not be nil", srv.Name)
@@ -123,13 +128,13 @@ func (srv *Service) createProxy(serviceGate *serviceGate) error {
 
 	b, err := ioutil.ReadFile(srv.Security.TLSCert)
 	if err != nil {
-		return errors.Wrap(err, "FAILED_TO_READ_CERT_FILE")
+		return errors.Wrap(err, "failed to read cert file")
 	}
 
 	// append to cert pool
 	cp := x509.NewCertPool()
 	if !cp.AppendCertsFromPEM(b) {
-		msg := fmt.Sprintf("FAILED_TO_APPEND_CERT: %v", err)
+		msg := fmt.Sprintf("failed to append cert file: %v", err)
 		return errors.New(msg)
 	}
 
@@ -143,93 +148,11 @@ func (srv *Service) createProxy(serviceGate *serviceGate) error {
 			MaxIdleConns:    50,
 			IdleConnTimeout: 10 * time.Second,
 			TLSClientConfig: &tls.Config{
-				ServerName:         srv.Security.ServerName,
-				RootCAs:            cp,
-				InsecureSkipVerify: true,
+				ServerName: srv.Security.ServerName,
+				RootCAs:    cp,
 			},
 		},
 	}
 
 	return nil
-}
-
-func (srv *Service) updateHTTP2(serviceGate *serviceGate) error {
-	if srv.HTTP2 == nil {
-		return nil
-	}
-
-	// add server push
-	err := srv.addServerPush()
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (srv *Service) addServerPush() error {
-	serverPush := srv.HTTP2.ServerPush
-	if serverPush != nil {
-		serverPush.options = &http.PushOptions{
-			Method: http.MethodGet,
-			Header: http.Header{
-				"pushed-from": []string{"api"},
-			},
-		}
-		serverPush.pushMap = make(map[string][]string, 0)
-		serverPushFiles := serverPush.pushMap
-
-		// Enable push support for this service
-		if serverPush.PushContents != nil && len(serverPush.PushContents) > 0 {
-			serverPush.Enabled = true
-		}
-
-		for _, pushContent := range serverPush.PushContents {
-			for _, pushPath := range pushContent.Paths {
-				// path to have / at beginning
-				path := "/" + strings.TrimPrefix(pushPath, "/")
-
-				// add files
-				for _, file := range pushContent.Files {
-					target := "/" + strings.TrimPrefix(file, "/")
-					serverPushFiles[path] = append(serverPushFiles[path], target)
-				}
-
-				// add directories
-				for _, dir := range pushContent.Directories {
-					fileInfos, err := ioutil.ReadDir(dir)
-					if err != nil {
-						return errors.Wrap(err, "failed to read directory files")
-					}
-
-					// add directory files
-					for _, fileInfo := range fileInfos {
-						target := "/" + strings.TrimPrefix(
-							filepath.Join(dir, fileInfo.Name()), "/",
-						)
-						serverPushFiles[path] = append(serverPushFiles[path], target)
-					}
-				}
-			}
-		}
-	}
-
-	return nil
-}
-
-func (srv *Service) pushContent(w http.ResponseWriter, r *http.Request) {
-	// push content to the client if the service has push support
-	if srv.HTTP2.ServerPush.Enabled {
-		// check if url path is in list of server push paths
-		pushFiles, ok := srv.HTTP2.ServerPush.pushMap[r.URL.Path]
-		if ok {
-			pusher, ok := w.(http.Pusher)
-			if ok {
-				for _, target := range pushFiles {
-					// push content
-					pusher.Push(target, srv.HTTP2.ServerPush.options)
-				}
-			}
-		}
-	}
 }
