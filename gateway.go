@@ -51,7 +51,7 @@ func New(services map[string]*Service) (gw *ServiceGate, err error) {
 }
 
 // NewFromFile creates a service gateway from a yaml services definition file
-func NewFromFile(redirectCode int, servicesFile string) (gw *ServiceGate, err error) {
+func NewFromFile(servicesFile string) (gw *ServiceGate, err error) {
 	defer func() {
 		if err1 := recover(); err1 != nil {
 			err = errors.Errorf("panic happened: %v", err1)
