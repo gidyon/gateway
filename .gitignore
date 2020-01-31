@@ -1,2 +1,4 @@
 conn/
 parse/
+test/
+*_v[0-9].go
