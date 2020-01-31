@@ -1,6 +1,6 @@
 services:
   accounts:
-    gatewayPath: /api/account/
+    urlPath: /api/account/
     address: accounts.mydomain.com
     port: 443
     security:
@@ -9,10 +9,10 @@ services:
       server: accounts.mydomain.com
   
   notifications:
-    gatewayPath: /api/notifications/
-    address: notifications.mydomain.com
-    port: 443
+    urlPath: /api/notifications/
+    address: notifications.mydomain.com # IP address or domain name
+    port: 443 # Port number to connecting to the address
     security:
       tlsKey: /run/secrets/tls_key
       tlsCert: /run/secrets/tls_cert
-      server: notifications.mydomain.com
+      serverName: notifications.mydomain.com
