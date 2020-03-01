@@ -93,7 +93,19 @@ func (g *Gateway) HandleFunc(pattern string, handler func(w http.ResponseWriter,
 
 // Handler returns http.Handler for the gateway
 func (g *Gateway) Handler() http.Handler {
-	return g.muxer
+	// Apply middlewares
+	apply := func(handler http.Handler, middlewares ...func(http.Handler) http.Handler) http.Handler {
+		if len(middlewares) < 1 {
+			return handler
+		}
+		wrapped := handler
+		for i := len(middlewares) - 1; i >= 0; i-- {
+			wrapped = middlewares[i](wrapped)
+		}
+		return wrapped
+	}
+
+	return apply(g.muxer, g.middlewares...)
 }
 
 func (g *Gateway) updateServices() error {
