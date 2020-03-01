@@ -23,7 +23,7 @@ type gatewayBufferPool struct {
 	pool *sync.Pool
 }
 
-// newBufferPool creates a bytes pool to be used by reverse proxy server while copying responses
+// newBufferPool creates a bytes pool to be used by httputil reverse proxy while copying response
 func newBufferPool() httputil.BufferPool {
 	return &gatewayBufferPool{
 		pool: &sync.Pool{
@@ -48,7 +48,7 @@ type Service struct {
 	Name               string             `yaml:"name"`
 	URLPath            string             `yaml:"urlPath"`
 	Address            string             `yaml:"address"`
-	Port               int                `yaml:"port"`
+	Insecure           bool               `yaml:"insecure"`
 	Security           *ServiceTLSOptions `yaml:"security"`
 	proxy              *httputil.ReverseProxy
 	responseBufferPool httputil.BufferPool
@@ -56,20 +56,17 @@ type Service struct {
 
 // ServiceTLSOptions contains options to configure TLS for a service
 type ServiceTLSOptions struct {
-	TLSKey     string `yaml:"tlsKey"`
 	TLSCert    string `yaml:"tlsCert"`
 	ServerName string `yaml:"server"`
 }
 
-func (srv *Service) update(serviceGate *ServiceGate) error {
-	// checks service information is correct
+func (srv *Service) init(g *Gateway) error {
 	err := srv.validate()
 	if err != nil {
 		return errors.Wrap(err, "failed to validate service")
 	}
 
-	// creates a proxy for the service
-	err = srv.createProxy(serviceGate)
+	err = srv.createProxy(g)
 	if err != nil {
 		return errors.Wrap(err, "failed to create service proxy")
 	}
@@ -78,36 +75,45 @@ func (srv *Service) update(serviceGate *ServiceGate) error {
 }
 
 func (srv *Service) validate() error {
+	if srv.Address == "" {
+		return errors.Errorf("service %q: address cannot be empty", srv.Name)
+	}
+	if srv.URLPath == "" {
+		return errors.Errorf("service %q: url path cannot be empty", srv.Name)
+	}
+
 	var (
-		warn bool
+		warn    bool
+		address = strings.TrimPrefix(srv.Address, "https://")
+		URLPath = strings.TrimPrefix(srv.URLPath, "/")
 	)
 
-	address := strings.TrimPrefix(strings.TrimSuffix(srv.Address, "/"), "https://")
-	srv.Address = fmt.Sprintf("https://%s", address)
-	if srv.Address == "" {
-		return errors.Errorf("service %q address cannot be empty", srv.Name)
+	baseScheme := func() string {
+		if srv.Insecure {
+			return "http"
+		}
+		return "https"
 	}
 
-	URLPath := strings.TrimPrefix(srv.URLPath, "/")
-	srv.URLPath = fmt.Sprintf("/%s", URLPath)
-	if srv.URLPath == "" {
-		return errors.Errorf("service %q url path cannot be empty", srv.Name)
-	}
+	scheme := baseScheme()
 
-	if srv.Port == 0 {
-		warn = true
-		srv.Port = 443
-		logrus.Warnf("using default port 443 for service %q", srv.Name)
-	}
+	address = strings.TrimSuffix(address, "/")
+	srv.Address = fmt.Sprintf("%s://%s", scheme, address)
 
-	if srv.Security.TLSCert == "" {
-		warn = true
-		srv.Security.TLSCert = "certs/cert.pem"
-		logrus.Warnf("using default tls public key for service %q", srv.Name)
-	}
-	if srv.Security.ServerName == "" {
-		warn = true
-		logrus.Warnf("using default tls server name for service %q", srv.Name)
+	URLPath = strings.TrimSuffix(URLPath, "/")
+	srv.URLPath = fmt.Sprintf("/%s/", URLPath)
+
+	if !srv.Insecure {
+		if srv.Security.TLSCert == "" {
+			warn = true
+			srv.Security.TLSCert = "certs/cert.pem"
+			logrus.Warnf("using default tls public key for service %q", srv.Name)
+		}
+		if srv.Security.ServerName == "" {
+			warn = true
+			srv.Security.ServerName = "localhost"
+			logrus.Warnf("using default tls server name for service %q", srv.Name)
+		}
 	}
 
 	// Print one line space to separate service warning
@@ -118,9 +124,9 @@ func (srv *Service) validate() error {
 	return nil
 }
 
-func (srv *Service) createProxy(serviceGate *ServiceGate) error {
-	if serviceGate == nil {
-		return errors.New("service gateway should not be nil")
+func (srv *Service) createProxy(g *Gateway) error {
+	if g == nil {
+		return errors.New("service gate should not be nil")
 	}
 	if srv == nil {
 		return errors.Errorf("service %q should not be nil", srv.Name)
@@ -128,22 +134,22 @@ func (srv *Service) createProxy(serviceGate *ServiceGate) error {
 
 	b, err := ioutil.ReadFile(srv.Security.TLSCert)
 	if err != nil {
-		return errors.Wrap(err, "failed to read cert file")
+		return errors.Wrap(err, "FAILED_TO_READ_CERT_FILE")
 	}
 
 	// append to cert pool
 	cp := x509.NewCertPool()
 	if !cp.AppendCertsFromPEM(b) {
-		msg := fmt.Sprintf("failed to append cert file: %v", err)
+		msg := fmt.Sprintf("FAILED_TO_APPEND_CERT: %v", err)
 		return errors.New(msg)
 	}
 
 	// set service proxy client
 	srv.proxy = &httputil.ReverseProxy{
-		Director:       serviceGate.requestMiddleware,
+		Director:       g.requestMiddleware,
 		BufferPool:     newBufferPool(),
-		ModifyResponse: serviceGate.responseMiddleware,
-		ErrorHandler:   serviceGate.errorHandler,
+		ModifyResponse: g.responseMiddleware,
+		ErrorHandler:   g.errorHandler,
 		Transport: &http.Transport{
 			MaxIdleConns:    50,
 			IdleConnTimeout: 10 * time.Second,
