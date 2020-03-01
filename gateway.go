@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"fmt"
+	"github.com/Sirupsen/logrus"
 	"github.com/pkg/errors"
 	yaml "gopkg.in/yaml.v2"
 	"io"
@@ -63,13 +64,15 @@ func NewFromFile(servicesFile string) (gw *ServiceGate, err error) {
 	// Read the service definitions from YAML
 	services, err := readYAML(servicesFile)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to read read YAML")
+		return nil, errors.Wrap(err, "failed to read YAML")
 	}
 
 	err = gw.registerServices(services)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to update gateway")
 	}
+
+	logrus.Infoln(gw.services)
 
 	return gw, err
 }
@@ -126,6 +129,8 @@ func (gateway *ServiceGate) proxy(w http.ResponseWriter, r *http.Request, servic
 		return
 	}
 
+	logrus.Infoln("new url host is:", newURL.Host)
+
 	// update the URL paths
 	r.Host = newURL.Host
 	r.URL.Host = newURL.Host
@@ -146,6 +151,8 @@ func (gateway *ServiceGate) registerServices(services map[string]*Service) error
 		if err != nil {
 			return errors.Errorf("failed to update service %q: %v", serviceID, err)
 		}
+
+		gateway.services[srv.Name] = srv
 
 		path := strings.TrimSuffix(srv.URLPath, "/") + "/"
 
